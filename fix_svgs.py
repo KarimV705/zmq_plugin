@@ -47,14 +47,8 @@ def fix_svg(file_path, is_vaporwave=False):
             gradient.set('x2', '0')
             gradient.set('gradientUnits', 'userSpaceOnUse')
             
-            if grad_id == '_Linear1':
+            if grad_id in ['_Linear1', '_Linear3', '_Linear4']:
                 gradient.set('y1', '0')
-                gradient.set('y2', '1584')
-            elif grad_id == '_Linear3':
-                gradient.set('y1', '559')
-                gradient.set('y2', '1584')
-            elif grad_id == '_Linear4':
-                gradient.set('y1', '1114')
                 gradient.set('y2', '1584')
                 
     # Save back to file
