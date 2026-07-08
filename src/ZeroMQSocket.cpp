@@ -534,20 +534,7 @@ struct ZeroMQSocketWidget : ModuleWidget {
         nvgFillColor(args.vg, textColor);
         nvgText(args.vg, 75.f, 172.f, "CV OUT (1-9)", nullptr);
 
-        nvgFontSize(args.vg, 8.5f);
-        nvgFillColor(args.vg, subColor);
-        // CV Numbers (Сетка выходов - смещены вниз под гнезда: 204px, 239px, 274px)
-        nvgText(args.vg, 37.5f, 204.f, "1", nullptr);
-        nvgText(args.vg, 75.f, 204.f, "2", nullptr);
-        nvgText(args.vg, 112.5f, 204.f, "3", nullptr);
 
-        nvgText(args.vg, 37.5f, 239.f, "4", nullptr);
-        nvgText(args.vg, 75.f, 239.f, "5", nullptr);
-        nvgText(args.vg, 112.5f, 239.f, "6", nullptr);
-
-        nvgText(args.vg, 37.5f, 274.f, "7", nullptr);
-        nvgText(args.vg, 75.f, 274.f, "8", nullptr);
-        nvgText(args.vg, 112.5f, 274.f, "9", nullptr);
 
         // 3. Секция Poly MIDI Out
         nvgFontSize(args.vg, 9.f);
