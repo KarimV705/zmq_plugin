@@ -379,8 +379,26 @@ struct OLEDDisplay : TransparentWidget {
 };
 
 // ─────────────────────────────────────────────────────────────
+struct TransparentTransformWidget : widget::TransformWidget {
+    float opacity = 0.4f;
+    void draw(const DrawArgs& args) override {
+        nvgSave(args.vg);
+        nvgGlobalAlpha(args.vg, opacity);
+        widget::TransformWidget::draw(args);
+        nvgRestore(args.vg);
+    }
+    void drawLayer(const DrawArgs& args, int layer) override {
+        nvgSave(args.vg);
+        nvgGlobalAlpha(args.vg, opacity);
+        widget::TransformWidget::drawLayer(args, layer);
+        nvgRestore(args.vg);
+    }
+};
+
+// ─────────────────────────────────────────────────────────────
 struct ZeroMQSocketWidget : ModuleWidget {
     OLEDDisplay* display = nullptr;
+    TransparentTransformWidget* logoTransform = nullptr;
     widget::SvgWidget* logoWidget = nullptr;
     std::shared_ptr<Font> panelFont;
 
@@ -401,20 +419,22 @@ struct ZeroMQSocketWidget : ModuleWidget {
         display = createWidget<OLEDDisplay>(mm2px(Vec(5.08, 10.0)));
         addChild(display);
 
-        // Добавляем логотип discotemple с масштабированием через TransformWidget
-        widget::TransformWidget* logoTransform = new widget::TransformWidget();
+        // Добавляем логотип discotemple с масштабированием и прозрачностью через TransparentTransformWidget
+        logoTransform = new TransparentTransformWidget();
         logoTransform->identity();
         
-        // Масштабируем с 5334px (ширина оригинального SVG) до целевых 30мм (88.58px)
-        float targetWidthPx = mm2px(30.0f);
+        // Масштабируем с 5334px (ширина оригинального SVG) до целевых 20мм (59.05px)
+        float targetWidthPx = mm2px(20.0f);
         float scaleFactor = targetWidthPx / 5334.0f;
         logoTransform->scale(Vec(scaleFactor, scaleFactor));
+        logoTransform->opacity = 0.4f; // 40% непрозрачности (полупрозрачный)
         
         logoWidget = new widget::SvgWidget();
         logoWidget->setSvg(APP->window->loadSvg(asset::plugin(pluginInstance, "res/discotemple_light.svg")));
         logoTransform->addChild(logoWidget);
         
-        logoTransform->box.pos = mm2px(Vec(10.4, 38.0));
+        // Позиционируем в самом низу панели (по центру по горизонтали: x = 15.4мм, y = 120.0мм)
+        logoTransform->box.pos = mm2px(Vec(15.4, 120.0));
         addChild(logoTransform);
 
         addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(12.7, 52.0)), module, ZeroMQSocket::PORT_PARAM));
