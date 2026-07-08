@@ -32,6 +32,7 @@ struct DisplaySnapshot {
     bool   connected   = false;
     float  cv[9]       = {};
     float  gate[16]    = {};
+    float  pitch[16]   = {};
     int    theme       = 0;      // 0 = Light, 1 = Dark, 2 = Jungle, 3 = Vaporwave
 };
 
@@ -328,8 +329,9 @@ struct ZeroMQSocket : Module {
                 snapshot.bypassed  = bypassed;
                 snapshot.connected = connected;
                 snapshot.theme     = theme;  // Передаем тему в UI
-                std::memcpy(snapshot.cv,   activeFrame.cv,        sizeof(snapshot.cv));
-                std::memcpy(snapshot.gate, activeFrame.midi_gate,  sizeof(snapshot.gate));
+                std::memcpy(snapshot.cv,    activeFrame.cv,         sizeof(snapshot.cv));
+                std::memcpy(snapshot.gate,  activeFrame.midi_gate,  sizeof(snapshot.gate));
+                std::memcpy(snapshot.pitch, activeFrame.midi_pitch, sizeof(snapshot.pitch));
                 snapshotMutex.unlock();
                 snapshotDirty.store(true, std::memory_order_release);
             }
@@ -437,9 +439,9 @@ struct ZeroMQSocketWidget : ModuleWidget {
         logoTransform->box.pos = mm2px(Vec(15.4, 120.0));
         addChild(logoTransform);
 
-        addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(12.7, 52.0)), module, ZeroMQSocket::PORT_PARAM));
-        addParam(createParamCentered<CKSS>(mm2px(Vec(25.4, 52.0)), module, ZeroMQSocket::PROTO_PARAM));
-        addParam(createParamCentered<CKSS>(mm2px(Vec(38.1, 52.0)), module, ZeroMQSocket::BP_PARAM));
+        addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(12.7, 47.0)), module, ZeroMQSocket::PORT_PARAM));
+        addParam(createParamCentered<CKSS>(mm2px(Vec(25.4, 47.0)), module, ZeroMQSocket::PROTO_PARAM));
+        addParam(createParamCentered<CKSS>(mm2px(Vec(38.1, 47.0)), module, ZeroMQSocket::BP_PARAM));
 
         for (int i = 0; i < 9; i++) {
             int row = i / 3, col = i % 3;
@@ -534,18 +536,18 @@ struct ZeroMQSocketWidget : ModuleWidget {
 
         nvgFontSize(args.vg, 8.5f);
         nvgFillColor(args.vg, subColor);
-        // CV Numbers (Сетка выходов)
-        nvgText(args.vg, 37.5f, 186.f, "1", nullptr);
-        nvgText(args.vg, 75.f, 186.f, "2", nullptr);
-        nvgText(args.vg, 112.5f, 186.f, "3", nullptr);
+        // CV Numbers (Сетка выходов - смещены вниз под гнезда: 204px, 239px, 274px)
+        nvgText(args.vg, 37.5f, 204.f, "1", nullptr);
+        nvgText(args.vg, 75.f, 204.f, "2", nullptr);
+        nvgText(args.vg, 112.5f, 204.f, "3", nullptr);
 
-        nvgText(args.vg, 37.5f, 221.f, "4", nullptr);
-        nvgText(args.vg, 75.f, 221.f, "5", nullptr);
-        nvgText(args.vg, 112.5f, 221.f, "6", nullptr);
+        nvgText(args.vg, 37.5f, 239.f, "4", nullptr);
+        nvgText(args.vg, 75.f, 239.f, "5", nullptr);
+        nvgText(args.vg, 112.5f, 239.f, "6", nullptr);
 
-        nvgText(args.vg, 37.5f, 256.f, "7", nullptr);
-        nvgText(args.vg, 75.f, 256.f, "8", nullptr);
-        nvgText(args.vg, 112.5f, 256.f, "9", nullptr);
+        nvgText(args.vg, 37.5f, 274.f, "7", nullptr);
+        nvgText(args.vg, 75.f, 274.f, "8", nullptr);
+        nvgText(args.vg, 112.5f, 274.f, "9", nullptr);
 
         // 3. Секция Poly MIDI Out
         nvgFontSize(args.vg, 9.f);
@@ -616,6 +618,16 @@ void OLEDDisplay::step() {
 }
 
 // ─────────────────────────────────────────────────────────────
+static std::string getNoteName(float voltage) {
+    int noteNum = (int)std::round(voltage * 12.f + 60.f);
+    if (noteNum < 0 || noteNum > 127) return "--";
+    const char* noteNames[] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
+    std::string name = noteNames[noteNum % 12];
+    int octave = (noteNum / 12) - 1;
+    return name + std::to_string(octave);
+}
+
+// ─────────────────────────────────────────────────────────────
 //  OLEDDisplay::draw() — читает только cachedSnapshot.
 // ─────────────────────────────────────────────────────────────
 void OLEDDisplay::draw(const DrawArgs& args) {
@@ -652,8 +664,6 @@ void OLEDDisplay::draw(const DrawArgs& args) {
     NVGcolor textColor;
     NVGcolor textDimColor;
     NVGcolor accentColor;
-    NVGcolor voiceActiveColor;
-    NVGcolor voiceInactiveColor;
 
     std::string offlineText = "OFFLINE";
     std::string onlineText = "ONLINE";
@@ -666,24 +676,18 @@ void OLEDDisplay::draw(const DrawArgs& args) {
         textColor = nvgRGBA(32, 32, 32, 255);
         textDimColor = nvgRGBA(112, 112, 112, 255);
         accentColor = s.connected ? nvgRGBA(0, 160, 64, 255) : nvgRGBA(208, 32, 32, 255);
-        voiceActiveColor = nvgRGBA(230, 115, 0, 255);
-        voiceInactiveColor = nvgRGBA(208, 208, 208, 255);
     } else if (s.theme == 1) { // Dark Theme
         bgColor = nvgRGBA(10, 13, 20, 255);
         borderColor = nvgRGBA(40, 50, 70, 255);
         textColor = nvgRGBA(100, 200, 255, 255);
         textDimColor = nvgRGBA(150, 150, 150, 255);
         accentColor = s.connected ? nvgRGBA(0, 255, 100, 255) : nvgRGBA(255, 50, 50, 255);
-        voiceActiveColor = nvgRGBA(255, 180, 0, 255);
-        voiceInactiveColor = nvgRGBA(40, 45, 55, 255);
     } else if (s.theme == 2) { // Jungle Theme
         bgColor = nvgRGBA(8, 20, 9, 255);
         borderColor = nvgRGBA(85, 107, 47, 255);
         textColor = nvgRGBA(57, 255, 20, 255);
         textDimColor = nvgRGBA(107, 142, 35, 255);
         accentColor = s.connected ? nvgRGBA(255, 215, 0, 255) : nvgRGBA(255, 69, 0, 255);
-        voiceActiveColor = nvgRGBA(255, 140, 0, 255);
-        voiceInactiveColor = nvgRGBA(27, 45, 24, 255);
 
         offlineText = "LOST IN JUNGLE 🌴";
         onlineText = "HUNTING 🐆";
@@ -695,8 +699,6 @@ void OLEDDisplay::draw(const DrawArgs& args) {
         textColor = nvgRGBA(1, 205, 254, 255);
         textDimColor = nvgRGBA(185, 103, 255, 255);
         accentColor = s.connected ? nvgRGBA(255, 251, 150, 255) : nvgRGBA(5, 0, 255, 255);
-        voiceActiveColor = nvgRGBA(255, 113, 206, 255);
-        voiceInactiveColor = nvgRGBA(77, 0, 128, 255);
 
         offlineText = "S A D N E S S 💾";
         onlineText = "V I B I N G 🌌";
@@ -722,71 +724,92 @@ void OLEDDisplay::draw(const DrawArgs& args) {
     char buf[64];
     nvgFontSize(args.vg, 8.f);
     nvgFillColor(args.vg, textColor);
+    nvgTextAlign(args.vg, NVG_ALIGN_LEFT | NVG_ALIGN_BASELINE);
     std::snprintf(buf, sizeof(buf), "PORT: %d", s.port);
-    nvgText(args.vg, 8, 14, buf, nullptr);
+    nvgText(args.vg, 8.f, 13.f, buf, nullptr);
 
     std::snprintf(buf, sizeof(buf), "PROTO: %s", s.proto == 1 ? "SUB" : "PULL");
-    nvgText(args.vg, 8, 25, buf, nullptr);
+    nvgText(args.vg, 8.f, 23.f, buf, nullptr);
 
     // ── Heartbeat-точка и статус ──────────────────────────────
     nvgBeginPath(args.vg);
-    nvgCircle(args.vg, box.size.x - 12.f, 10.f, 3.f);
+    nvgCircle(args.vg, box.size.x - 12.f, 9.f, 3.f);
     nvgFillColor(args.vg, accentColor);
     nvgFill(args.vg);
 
     nvgFontSize(args.vg, 7.f);
     nvgFillColor(args.vg, textDimColor);
-    nvgText(args.vg, box.size.x - 68.f, 13, s.connected ? onlineText.c_str() : offlineText.c_str(), nullptr);
+    nvgTextAlign(args.vg, NVG_ALIGN_RIGHT | NVG_ALIGN_BASELINE);
+    nvgText(args.vg, box.size.x - 20.f, 12.f, s.connected ? onlineText.c_str() : offlineText.c_str(), nullptr);
 
     // ── Статус байпаса ────────────────────────────────────────
     if (s.bypassed) {
         nvgFillColor(args.vg, nvgRGBA(255, 100, 100, 255));
-        nvgText(args.vg, box.size.x - 68.f, 25, bypassOnText.c_str(), nullptr);
+        nvgText(args.vg, box.size.x - 20.f, 23.f, bypassOnText.c_str(), nullptr);
     } else {
         nvgFillColor(args.vg, s.theme == 0 ? nvgRGBA(0, 150, 50, 255) : nvgRGBA(100, 255, 150, 255));
-        nvgText(args.vg, box.size.x - 68.f, 25, bypassOffText.c_str(), nullptr);
+        nvgText(args.vg, box.size.x - 20.f, 23.f, bypassOffText.c_str(), nullptr);
     }
 
-    // ── CV-метры (9 полосок) ──────────────────────────────────
-    constexpr float barW   = 8.f, barSp = 4.f;
-    constexpr float bX     = 8.f, bY    = 44.f, bH = 10.f;
-
-    nvgFontSize(args.vg, 6.f);
+    // ── Сетка CV монитора (3x3 числовые значения) ────────────────
+    nvgFontSize(args.vg, 6.2f);
     nvgFillColor(args.vg, textDimColor);
-    nvgText(args.vg, bX, bY - 4.f, "CV INPUTS (1-9)", nullptr);
-
+    
     for (int i = 0; i < 9; i++) {
-        float val = std::max(-10.f, std::min(10.f, s.bypassed ? 0.f : s.cv[i]));
-        float norm = (val + 10.f) / 20.f;
-        float h    = norm * bH;
-        float x    = bX + i * (barW + barSp);
-
-        nvgBeginPath(args.vg);
-        nvgRect(args.vg, x, bY, barW, bH);
-        nvgFillColor(args.vg, s.theme == 0 ? nvgRGBA(220, 220, 220, 255) : nvgRGBA(30, 35, 45, 255));
-        nvgFill(args.vg);
-
-        nvgBeginPath(args.vg);
-        nvgRect(args.vg, x, bY + (bH - h), barW, h);
-        nvgFillColor(args.vg, textColor);
-        nvgFill(args.vg);
+        int col = i % 3;
+        int row = i / 3;
+        float x = 8.f + col * 38.f;
+        float y = 35.f + row * 8.f;
+        
+        char cvBuf[32];
+        float val = s.bypassed ? 0.f : s.cv[i];
+        std::snprintf(cvBuf, sizeof(cvBuf), "CV%d:%+.1fV", i + 1, val);
+        
+        nvgTextAlign(args.vg, NVG_ALIGN_LEFT | NVG_ALIGN_BASELINE);
+        nvgText(args.vg, x, y, cvBuf, nullptr);
     }
 
-    // ── Индикаторы активности 16 голосов ─────────────────────
-    constexpr float dotR = 1.8f, dotSp = 6.6f;
-    constexpr float pX   = 9.f,  pY    = 64.f;
+    // ── Разделительная линия ──────────────────────────────────
+    nvgBeginPath(args.vg);
+    nvgMoveTo(args.vg, 6.f, 57.f);
+    nvgLineTo(args.vg, box.size.x - 6.f, 57.f);
+    nvgStrokeColor(args.vg, s.theme == 0 ? nvgRGBA(200, 200, 200, 255) : nvgRGBA(50, 60, 80, 255));
+    nvgStrokeWidth(args.vg, 0.5f);
+    nvgStroke(args.vg);
 
-    nvgFontSize(args.vg, 6.f);
-    nvgFillColor(args.vg, textDimColor);
-    nvgText(args.vg, pX, pY - 5.f, "POLY VOICE ACTIVITY", nullptr);
-
+    // ── Монитор активных нот полифонии ────────────────────────
+    int activeCount = 0;
+    std::vector<std::string> activeNotes;
     for (int c = 0; c < 16; c++) {
-        bool active = !s.bypassed && (s.gate[c] > 0.1f);
-        nvgBeginPath(args.vg);
-        nvgCircle(args.vg, pX + c * dotSp, pY + 1.f, dotR);
-        nvgFillColor(args.vg, active ? voiceActiveColor : voiceInactiveColor);
-        nvgFill(args.vg);
+        if (!s.bypassed && s.gate[c] > 0.1f) {
+            activeCount++;
+            if (activeNotes.size() < 5) {
+                activeNotes.push_back(getNoteName(s.pitch[c]));
+            }
+        }
     }
+
+    std::string notesStr = "";
+    for (size_t i = 0; i < activeNotes.size(); i++) {
+        if (i > 0) notesStr += " ";
+        notesStr += activeNotes[i];
+    }
+    if (activeCount > 5) {
+        notesStr += "...";
+    }
+
+    nvgFontSize(args.vg, 6.8f);
+    nvgFillColor(args.vg, textColor);
+    
+    char voicesBuf[128];
+    if (activeCount > 0) {
+        std::snprintf(voicesBuf, sizeof(voicesBuf), "VOICES: %d [%s]", activeCount, notesStr.c_str());
+    } else {
+        std::snprintf(voicesBuf, sizeof(voicesBuf), "VOICES: 0 [-]");
+    }
+    
+    nvgTextAlign(args.vg, NVG_ALIGN_LEFT | NVG_ALIGN_BASELINE);
+    nvgText(args.vg, 8.f, 65.f, voicesBuf, nullptr);
 }
 
 Model* modelZeroMQSocket = createModel<ZeroMQSocket, ZeroMQSocketWidget>("ZeroMQSocket");
