@@ -3,8 +3,12 @@
 #include <thread>
 #include <mutex>
 #include <atomic>
+#include <cstring>
 
-// Структура пакета данных
+// ─────────────────────────────────────────────────────────────
+//  Структура пакета данных (57 float = 228 байт)
+//  cv[9] + midi_pitch[16] + midi_gate[16] + midi_vel[16]
+// ─────────────────────────────────────────────────────────────
 struct ZmqAudioFrame {
     float cv[9];
     float midi_pitch[16];
@@ -12,183 +16,346 @@ struct ZmqAudioFrame {
     float midi_vel[16];
 };
 
+// ─────────────────────────────────────────────────────────────
+//  Вспомогательный snapshot — хранит копию данных для UI-потока
+//  без захвата мьютекса при каждом draw().
+// ─────────────────────────────────────────────────────────────
+struct DisplaySnapshot {
+    int    port        = 5555;
+    int    proto       = 0;      // 0=PULL, 1=SUB
+    bool   bypassed    = false;
+    bool   connected   = false;
+    float  cv[9]       = {};
+    float  gate[16]    = {};
+};
+
+// ─────────────────────────────────────────────────────────────
 struct ZeroMQSocket : Module {
-    enum ParamId { PORT_PARAM, PROTO_PARAM, BP_PARAM, PARAMS_LEN };
-    enum InputId { INPUTS_LEN };
+    enum ParamId  { PORT_PARAM, PROTO_PARAM, BP_PARAM, PARAMS_LEN };
+    enum InputId  { INPUTS_LEN };
     enum OutputId {
-        CV_OUT_1, CV_OUT_2, CV_OUT_3, CV_OUT_4, CV_OUT_5, CV_OUT_6, CV_OUT_7, CV_OUT_8, CV_OUT_9,
+        CV_OUT_1, CV_OUT_2, CV_OUT_3, CV_OUT_4, CV_OUT_5,
+        CV_OUT_6, CV_OUT_7, CV_OUT_8, CV_OUT_9,
         POLY_PITCH_OUT, POLY_GATE_OUT, POLY_VEL_OUT,
         OUTPUTS_LEN
     };
     enum LightId { LIGHTS_LEN };
 
-    // Сетевые потоки и буферизация
-    std::thread* workerThread = nullptr;
-    std::mutex bufferMutex;
-    std::atomic<bool> threadRunning{false};
-    zmq::context_t* context = nullptr;
-    zmq::socket_t* socket = nullptr;
-    
-    // Двойной буфер для потокобезопасности
-    ZmqAudioFrame activeFrame{};
-    ZmqAudioFrame backFrame{};
-    std::atomic<bool> newFrameAvailable{false};
+    // ── Сетевой поток ─────────────────────────────────────────
+    std::thread*           workerThread    = nullptr;
+    std::atomic<bool>      threadRunning   {false};
 
-    // Таймер отсутствия сетевой активности
-    std::atomic<float> timeSinceLastPacket;
+    // context и socket защищены workerMutex:
+    // они создаются/уничтожаются только из аудио-потока через
+    // requestRestart, а читаются только из воркера.
+    std::mutex             workerMutex;
+    zmq::context_t*        context         = nullptr;
+    zmq::socket_t*         socket          = nullptr;
 
-    int port = 5555;
-    int currentActivePort = 5555;
-    int currentActiveProto = 0; // 0 = PULL, 1 = SUB
+    // ── Двойной буфер (воркер → аудио) ───────────────────────
+    std::mutex             bufferMutex;
+    ZmqAudioFrame          backFrame       {};
+    std::atomic<bool>      newFrameAvailable {false};
 
+    // Аудио-буфер: читается ТОЛЬКО из process(), поэтому без блокировки.
+    ZmqAudioFrame          activeFrame     {};
+
+    // ── Snapshot для UI (аудио → draw) ────────────────────────
+    // Атомарный флаг + простая структура, защищённая snapshotMutex.
+    std::mutex             snapshotMutex;
+    DisplaySnapshot        snapshot;
+    std::atomic<bool>      snapshotDirty   {false};
+
+    // ── Счётчик неактивности ──────────────────────────────────
+    // FIX: используем int-счётчик вместо float-атомика, чтобы избежать
+    // non-atomic read-modify-write (load+store — не атомарно).
+    std::atomic<int>       inactiveFrames  {999999};
+
+    // ── Состояние параметров ──────────────────────────────────
+    int   currentActivePort  = 5555;
+    int   currentActiveProto = 0;
+
+    // FIX: флаг отложенного рестарта — изменение порта/протокола
+    // запрашивается из process(), но выполняется асинхронно,
+    // чтобы не блокировать аудио-поток во время join().
+    std::atomic<bool>      restartRequested {false};
+    std::thread            restartThread;
+
+    // ─────────────────────────────────────────────────────────
     ZeroMQSocket() {
-        timeSinceLastPacket.store(99.f);
         config(PARAMS_LEN, INPUTS_LEN, OUTPUTS_LEN, LIGHTS_LEN);
-        
-        configParam(PORT_PARAM, 1024.f, 65535.f, 5555.f, "ZMQ Port");
-        configParam(PROTO_PARAM, 0.f, 1.f, 0.f, "Protocol (PULL/SUB)");
-        configParam(BP_PARAM, 0.f, 1.f, 0.f, "Bypass");
-        
-        // Конфигурация портов
-        for (int i = 0; i < 9; i++) {
-            configOutput(CV_OUT_1 + i, "CV Channel " + std::to_string(i + 1));
-        }
-        configOutput(POLY_PITCH_OUT, "Polyphonic Pitch (V/OCT)");
-        configOutput(POLY_GATE_OUT, "Polyphonic Gate");
-        configOutput(POLY_VEL_OUT, "Polyphonic Velocity");
 
-        // Запуск фонового сетевого потока
-        port = (int)params[PORT_PARAM].getValue();
-        currentActivePort = port;
+        // FIX: snapValue(1.f) даёт шаг 1 — целые числа портов
+        configParam(PORT_PARAM, 1024.f, 65535.f, 5555.f, "ZMQ Port")->snapEnabled = true;
+        configParam(PROTO_PARAM, 0.f, 1.f, 0.f, "Protocol (PULL/SUB)");
+        configParam(BP_PARAM,   0.f, 1.f, 0.f, "Bypass");
+
+        for (int i = 0; i < 9; i++)
+            configOutput(CV_OUT_1 + i, "CV Channel " + std::to_string(i + 1));
+        configOutput(POLY_PITCH_OUT, "Polyphonic Pitch (V/OCT)");
+        configOutput(POLY_GATE_OUT,  "Polyphonic Gate");
+        configOutput(POLY_VEL_OUT,   "Polyphonic Velocity");
+
+        currentActivePort  = (int)std::round(params[PORT_PARAM].getValue());
         currentActiveProto = (int)params[PROTO_PARAM].getValue();
-        startWorker();
+        startWorker(currentActivePort, currentActiveProto);
     }
 
     ~ZeroMQSocket() {
+        // Убеждаемся, что поток рестарта завершён
+        if (restartThread.joinable())
+            restartThread.join();
         stopWorker();
     }
 
-    void startWorker() {
-        threadRunning = true;
-        int bindPort = currentActivePort;
-        int bindProto = currentActiveProto;
-        
+    // ── Запуск воркера ────────────────────────────────────────
+    // Вызывается ТОЛЬКО из аудио-потока (или деструктора).
+    void startWorker(int bindPort, int bindProto) {
+        // FIX: полный сброс флагов перед запуском
+        inactiveFrames.store(999999);
+        newFrameAvailable.store(false);
+        threadRunning.store(true);
+
         try {
+            std::lock_guard<std::mutex> lk(workerMutex);
             context = new zmq::context_t(1);
-            socket = new zmq::socket_t(*context, bindProto == 1 ? zmq::socket_type::sub : zmq::socket_type::pull);
-            
-            zmq::socket_t* localSocket = socket;
-            
-            workerThread = new std::thread([this, localSocket, bindPort, bindProto]() {
+            socket  = new zmq::socket_t(
+                *context,
+                bindProto == 1 ? zmq::socket_type::sub
+                               : zmq::socket_type::pull
+            );
+
+            // FIX: захватываем сырой указатель в лямбду, а не this->socket,
+            // чтобы избежать обращения к уже удалённому указателю.
+            zmq::socket_t* rawSocket = socket;
+
+            workerThread = new std::thread([this, rawSocket, bindPort, bindProto]() {
                 try {
-                    std::string bindAddress = "tcp://*:" + std::to_string(bindPort);
-                    localSocket->bind(bindAddress);
-                    localSocket->set(zmq::sockopt::rcvtimeo, 500); // Таймаут чтения 500мс
-                    
-                    if (bindProto == 1) {
-                        localSocket->set(zmq::sockopt::subscribe, "");
-                    }
-                    
-                    while (threadRunning) {
-                        zmq::message_t message;
-                        auto result = localSocket->recv(message, zmq::recv_flags::none);
-                        
-                        if (result && message.size() == sizeof(ZmqAudioFrame)) {
-                            // Быстро копируем данные в фоновый буфер
-                            std::lock_guard<std::mutex> lock(bufferMutex);
-                            std::memcpy(&backFrame, message.data(), sizeof(ZmqAudioFrame));
-                            newFrameAvailable = true;
-                            timeSinceLastPacket.store(0.f); // Сбрасываем таймер активности
+                    std::string addr = "tcp://*:" + std::to_string(bindPort);
+                    rawSocket->bind(addr);
+                    rawSocket->set(zmq::sockopt::rcvtimeo, 200); // 200ms таймаут
+
+                    if (bindProto == 1)
+                        rawSocket->set(zmq::sockopt::subscribe, "");
+
+                    zmq::message_t msg;
+                    while (threadRunning.load(std::memory_order_relaxed)) {
+                        // FIX: явный recv_flags::none, результат проверяем надёжно
+                        auto res = rawSocket->recv(msg, zmq::recv_flags::none);
+
+                        if (!res) {
+                            // Таймаут (EAGAIN через rcvtimeo) — нормальная ситуация
+                            continue;
                         }
+
+                        if (msg.size() != sizeof(ZmqAudioFrame)) {
+                            // FIX: пропускаем пакеты неверного размера вместо молчания
+                            DEBUG("ZeroMQ: unexpected packet size %u (expected %u)",
+                                  (unsigned)msg.size(), (unsigned)sizeof(ZmqAudioFrame));
+                            continue;
+                        }
+
+                        {
+                            std::lock_guard<std::mutex> lk(bufferMutex);
+                            std::memcpy(&backFrame, msg.data(), sizeof(ZmqAudioFrame));
+                        }
+                        newFrameAvailable.store(true, std::memory_order_release);
+                        inactiveFrames.store(0, std::memory_order_relaxed);
                     }
+                } catch (const zmq::error_t& e) {
+                    // ETERM — нормальное завершение при context->close()
+                    if (e.num() != ETERM)
+                        DEBUG("ZeroMQ worker error (port=%d, proto=%d): %s",
+                              bindPort, bindProto, e.what());
                 } catch (const std::exception& e) {
-                    DEBUG("ZeroMQ Error on port %d (proto %d): %s", bindPort, bindProto, e.what());
+                    DEBUG("ZeroMQ worker std::exception: %s", e.what());
                 }
+                // FIX: воркер всегда сбрасывает флаг при выходе,
+                // чтобы stopWorker() корректно определил завершение.
+                threadRunning.store(false, std::memory_order_relaxed);
             });
+
         } catch (const std::exception& e) {
-            DEBUG("ZeroMQ Thread Init Error on port %d (proto %d): %s", bindPort, bindProto, e.what());
+            // FIX: при ошибке инициализации освобождаем уже созданные объекты
+            DEBUG("ZeroMQ init error: %s", e.what());
+            threadRunning.store(false);
+            std::lock_guard<std::mutex> lk(workerMutex);
+            delete socket;  socket  = nullptr;
+            delete context; context = nullptr;
         }
     }
 
+    // ── Остановка воркера ─────────────────────────────────────
+    // Вызывается из аудио-потока, деструктора или restartThread.
     void stopWorker() {
-        threadRunning = false;
-        if (socket) {
-            try {
-                socket->close();
-            } catch (...) {}
-        }
-        if (context) {
-            try {
-                context->close();
-            } catch (...) {}
-        }
-        if (workerThread) {
-            if (workerThread->joinable()) {
-                workerThread->join();
+        threadRunning.store(false, std::memory_order_relaxed);
+
+        // Закрываем сокет и контекст — это разблокирует recv() в воркере
+        {
+            std::lock_guard<std::mutex> lk(workerMutex);
+            if (socket) {
+                try { socket->close(); } catch (...) {}
             }
+            if (context) {
+                try { context->close(); } catch (...) {}
+            }
+        }
+
+        if (workerThread) {
+            if (workerThread->joinable())
+                workerThread->join();
             delete workerThread;
             workerThread = nullptr;
         }
-        if (socket) {
-            delete socket;
-            socket = nullptr;
-        }
-        if (context) {
-            delete context;
-            context = nullptr;
+
+        {
+            std::lock_guard<std::mutex> lk(workerMutex);
+            delete socket;  socket  = nullptr;
+            delete context; context = nullptr;
         }
     }
 
-    void process(const ProcessArgs& args) override {
-        // Динамический перезапуск при изменении порта или протокола
-        int targetPort = (int)params[PORT_PARAM].getValue();
-        int targetProto = (int)params[PROTO_PARAM].getValue();
-        if (targetPort != currentActivePort || targetProto != currentActiveProto) {
+    // ── Асинхронный рестарт ───────────────────────────────────
+    // FIX: вместо блокирующего stopWorker() в аудио-потоке —
+    // запускаем рестарт в отдельном std::thread, аудио не тормозит.
+    void scheduleRestart(int newPort, int newProto) {
+        if (restartRequested.load()) return; // уже запланирован
+        restartRequested.store(true);
+
+        if (restartThread.joinable())
+            restartThread.join();
+
+        currentActivePort  = newPort;
+        currentActiveProto = newProto;
+
+        restartThread = std::thread([this, newPort, newProto]() {
             stopWorker();
-            currentActivePort = targetPort;
-            currentActiveProto = targetProto;
-            startWorker();
+            startWorker(newPort, newProto);
+            restartRequested.store(false);
+        });
+    }
+
+    // ─────────────────────────────────────────────────────────
+    void process(const ProcessArgs& args) override {
+        // ── Обнаружение изменения параметров ─────────────────
+        // FIX: округляем значение knob до целого (snapEnabled не всегда
+        // гарантирует int-значение в process).
+        int targetPort  = (int)std::round(params[PORT_PARAM].getValue());
+        int targetProto = (int)params[PROTO_PARAM].getValue();
+
+        if (!restartRequested.load() &&
+            (targetPort != currentActivePort || targetProto != currentActiveProto))
+        {
+            scheduleRestart(targetPort, targetProto);
         }
 
-        // Обновляем таймер неактивности
-        timeSinceLastPacket.store(timeSinceLastPacket.load() + args.sampleTime);
+        // ── Счётчик неактивности ──────────────────────────────
+        // FIX: инкрементируем int-атомик вместо float load+store.
+        // Ограничиваем значение, чтобы не было переполнения при длительном
+        // отсутствии данных (при 48kHz 999999 ≈ 20 секунд).
+        int inactive = inactiveFrames.load(std::memory_order_relaxed);
+        if (inactive < 999999)
+            inactiveFrames.store(inactive + 1, std::memory_order_relaxed);
 
-        // Проверяем наличие новых данных от ZMQ воркера
-        if (newFrameAvailable) {
+        // ── Получение нового фрейма от воркера ────────────────
+        // FIX: проверяем acquire-флаг, затем берём мьютекс только если
+        // данные действительно есть — минимизируем contention.
+        if (newFrameAvailable.load(std::memory_order_acquire)) {
             if (bufferMutex.try_lock()) {
                 activeFrame = backFrame;
-                newFrameAvailable = false;
+                newFrameAvailable.store(false, std::memory_order_relaxed);
                 bufferMutex.unlock();
             }
         }
 
-        // Проверяем статус байпаса
         bool bypassed = (params[BP_PARAM].getValue() > 0.5f);
 
-        // 1. Вывод моно-сигналов CV (0-9)
+        // ── Вывод моно CV ─────────────────────────────────────
         for (int i = 0; i < 9; i++) {
             outputs[CV_OUT_1 + i].setVoltage(bypassed ? 0.f : activeFrame.cv[i]);
         }
 
-        // 2. Вывод полифонических MIDI/CV сигналов
-        outputs[POLY_PITCH_OUT].setChannels(16);
-        outputs[POLY_GATE_OUT].setChannels(16);
-        outputs[POLY_VEL_OUT].setChannels(16);
+        // ── Вывод полифонии ───────────────────────────────────
+        // FIX: при bypass выставляем 0 каналов — downstream модули
+        // (Split, VCO) должны видеть «нет сигнала», а не 16 каналов нулей.
+        if (bypassed) {
+            outputs[POLY_PITCH_OUT].setChannels(0);
+            outputs[POLY_GATE_OUT].setChannels(0);
+            outputs[POLY_VEL_OUT].setChannels(0);
+        } else {
+            // FIX: вычисляем реальное количество активных голосов
+            // вместо всегда-16, чтобы не засорять полифонические кабели.
+            int activeVoices = 0;
+            for (int c = 15; c >= 0; c--) {
+                if (activeFrame.midi_gate[c] > 0.001f) {
+                    activeVoices = c + 1;
+                    break;
+                }
+            }
+            // Минимум 1 канал, даже если нет активных нот
+            int numChannels = std::max(1, activeVoices);
 
-        for (int c = 0; c < 16; c++) {
-            outputs[POLY_PITCH_OUT].setVoltage(bypassed ? 0.f : activeFrame.midi_pitch[c], c);
-            outputs[POLY_GATE_OUT].setVoltage(bypassed ? 0.f : activeFrame.midi_gate[c], c);
-            outputs[POLY_VEL_OUT].setVoltage(bypassed ? 0.f : activeFrame.midi_vel[c], c);
+            outputs[POLY_PITCH_OUT].setChannels(numChannels);
+            outputs[POLY_GATE_OUT].setChannels(numChannels);
+            outputs[POLY_VEL_OUT].setChannels(numChannels);
+
+            for (int c = 0; c < numChannels; c++) {
+                outputs[POLY_PITCH_OUT].setVoltage(activeFrame.midi_pitch[c], c);
+                outputs[POLY_GATE_OUT].setVoltage(activeFrame.midi_gate[c], c);
+                outputs[POLY_VEL_OUT].setVoltage(activeFrame.midi_vel[c], c);
+            }
         }
+
+        // ── Обновление snapshot для UI (раз в ~1ms, не каждый сэмпл) ─
+        // FIX: вместо того чтобы UI-поток читал activeFrame напрямую
+        // (data race), аудио-поток периодически публикует snapshot.
+        static int uiUpdateCounter = 0;
+        if (++uiUpdateCounter >= 48) { // ~1ms при 48kHz
+            uiUpdateCounter = 0;
+            bool connected = (inactiveFrames.load(std::memory_order_relaxed) < 48 * 1000); // <1 sec
+
+            // try_lock чтобы не блокировать аудио если UI рисует
+            if (snapshotMutex.try_lock()) {
+                snapshot.port      = currentActivePort;
+                snapshot.proto     = currentActiveProto;
+                snapshot.bypassed  = bypassed;
+                snapshot.connected = connected;
+                std::memcpy(snapshot.cv,   activeFrame.cv,        sizeof(snapshot.cv));
+                std::memcpy(snapshot.gate, activeFrame.midi_gate,  sizeof(snapshot.gate));
+                snapshotMutex.unlock();
+                snapshotDirty.store(true, std::memory_order_release);
+            }
+        }
+    }
+
+    // ── Сериализация состояния ────────────────────────────────
+    json_t* dataToJson() override {
+        json_t* root = json_object();
+        json_object_set_new(root, "port",  json_integer(currentActivePort));
+        json_object_set_new(root, "proto", json_integer(currentActiveProto));
+        return root;
+    }
+
+    void dataFromJson(json_t* root) override {
+        json_t* jPort  = json_object_get(root, "port");
+        json_t* jProto = json_object_get(root, "proto");
+        if (jPort)  params[PORT_PARAM].setValue((float)json_integer_value(jPort));
+        if (jProto) params[PROTO_PARAM].setValue((float)json_integer_value(jProto));
     }
 };
 
-// Forward declarations
+// ─────────────────────────────────────────────────────────────
+//  Forward declaration
+// ─────────────────────────────────────────────────────────────
 struct ZeroMQSocketWidget;
 
-// Виджет OLED-дисплея
+// ─────────────────────────────────────────────────────────────
+//  OLED Дисплей
+// ─────────────────────────────────────────────────────────────
 struct OLEDDisplay : TransparentWidget {
     std::shared_ptr<Font> font;
+    // FIX: кэш snapshot на стороне UI — никакого прямого обращения к Module
+    DisplaySnapshot cachedSnapshot;
 
     OLEDDisplay() {
         box.size = Vec(120.f, 70.f);
@@ -196,72 +363,86 @@ struct OLEDDisplay : TransparentWidget {
     }
 
     void draw(const DrawArgs& args) override;
+    void step() override;
 };
 
+// ─────────────────────────────────────────────────────────────
 struct ZeroMQSocketWidget : ModuleWidget {
+    OLEDDisplay* display = nullptr;
+
     ZeroMQSocketWidget(ZeroMQSocket* module) {
         setModule(module);
         setPanel(createPanel(asset::plugin(pluginInstance, "res/ZeroMQSocket.svg")));
 
-        // Винты
         addChild(createWidget<ScrewSilver>(Vec(RACK_GRID_WIDTH, 0)));
         addChild(createWidget<ScrewSilver>(Vec(box.size.x - 2 * RACK_GRID_WIDTH, 0)));
         addChild(createWidget<ScrewSilver>(Vec(RACK_GRID_WIDTH, RACK_GRID_HEIGHT - RACK_GRID_WIDTH)));
         addChild(createWidget<ScrewSilver>(Vec(box.size.x - 2 * RACK_GRID_WIDTH, RACK_GRID_HEIGHT - RACK_GRID_WIDTH)));
 
-        // OLED Дисплей (размещение на x = 15px (5.08mm), y = 30px (10mm))
-        OLEDDisplay* display = createWidget<OLEDDisplay>(mm2px(Vec(5.08, 10.0)));
+        display = createWidget<OLEDDisplay>(mm2px(Vec(5.08, 10.0)));
         addChild(display);
 
-        // Ручка порта (x = 12.7mm, y = 52.0mm)
         addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(12.7, 52.0)), module, ZeroMQSocket::PORT_PARAM));
-        
-        // Переключатель протокола PULL/SUB (x = 25.4mm, y = 52.0mm)
         addParam(createParamCentered<CKSS>(mm2px(Vec(25.4, 52.0)), module, ZeroMQSocket::PROTO_PARAM));
-        
-        // Переключатель байпаса ON/OFF (x = 38.1mm, y = 52.0mm)
         addParam(createParamCentered<CKSS>(mm2px(Vec(38.1, 52.0)), module, ZeroMQSocket::BP_PARAM));
 
-        // 9 моно выходов CV в сетке 3x3
-        // Колонки: x = 12.7mm, 25.4mm, 38.1mm
-        // Ряды: y = 65.0mm, 77.0mm, 89.0mm
         for (int i = 0; i < 9; i++) {
-            int row = i / 3;
-            int col = i % 3;
+            int row = i / 3, col = i % 3;
             float x = 12.7f + col * 12.7f;
             float y = 65.0f + row * 12.0f;
             addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(x, y)), module, ZeroMQSocket::CV_OUT_1 + i));
         }
 
-        // Выходы MIDI Poly (в один ряд: x = 12.7mm, 25.4mm, 38.1mm, y = 110mm)
         addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(12.7, 110.0)), module, ZeroMQSocket::POLY_PITCH_OUT));
         addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(25.4, 110.0)), module, ZeroMQSocket::POLY_GATE_OUT));
         addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(38.1, 110.0)), module, ZeroMQSocket::POLY_VEL_OUT));
     }
 };
 
+// ─────────────────────────────────────────────────────────────
+//  OLEDDisplay::step() — вызывается из UI-потока каждый кадр.
+//  FIX: забираем snapshot здесь, а не в draw(), чтобы draw()
+//  работал только с локальными данными и был максимально быстрым.
+// ─────────────────────────────────────────────────────────────
+void OLEDDisplay::step() {
+    TransparentWidget::step();
+
+    ZeroMQSocketWidget* widget = dynamic_cast<ZeroMQSocketWidget*>(parent);
+    if (!widget) return;
+    ZeroMQSocket* module = dynamic_cast<ZeroMQSocket*>(widget->module);
+    if (!module) return;
+
+    // Забираем snapshot только если он обновился
+    if (module->snapshotDirty.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lk(module->snapshotMutex);
+        cachedSnapshot = module->snapshot;
+        module->snapshotDirty.store(false, std::memory_order_relaxed);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  OLEDDisplay::draw() — читает только cachedSnapshot.
+//  Никаких обращений к Module — нет data race.
+// ─────────────────────────────────────────────────────────────
 void OLEDDisplay::draw(const DrawArgs& args) {
-    // Фоновая заливка экрана (тёмно-синий OLED-цвет)
+    // Фон
     nvgBeginPath(args.vg);
     nvgRoundedRect(args.vg, 0, 0, box.size.x, box.size.y, 4.f);
     nvgFillColor(args.vg, nvgRGBA(10, 13, 20, 255));
     nvgFill(args.vg);
 
-    // Рамка экрана
+    // Рамка
     nvgStrokeColor(args.vg, nvgRGBA(40, 50, 70, 255));
     nvgStrokeWidth(args.vg, 1.5f);
     nvgStroke(args.vg);
 
     if (!font) return;
-
     nvgFontFaceId(args.vg, font->handle);
 
-    // Получаем указатель на модуль через родительский виджет
+    // ── Режим браузера (нет модуля) ───────────────────────────
     ZeroMQSocketWidget* widget = dynamic_cast<ZeroMQSocketWidget*>(parent);
-    ZeroMQSocket* module = widget ? dynamic_cast<ZeroMQSocket*>(widget->module) : nullptr;
-
-    if (!module) {
-        // Режим отображения в браузере модулей
+    bool hasModule = widget && widget->module;
+    if (!hasModule) {
         nvgFontSize(args.vg, 11.f);
         nvgFillColor(args.vg, nvgRGBA(100, 200, 255, 255));
         nvgText(args.vg, 10, 22, "ZMQ SOCKET", nullptr);
@@ -271,35 +452,32 @@ void OLEDDisplay::draw(const DrawArgs& args) {
         return;
     }
 
-    // Вывод текущего порта сокета и протокола
+    const DisplaySnapshot& s = cachedSnapshot;
+
+    // ── Порт и протокол ───────────────────────────────────────
+    char buf[64];
     nvgFontSize(args.vg, 8.f);
     nvgFillColor(args.vg, nvgRGBA(100, 200, 255, 255));
-    char portStr[32];
-    std::snprintf(portStr, sizeof(portStr), "PORT: %d", module->currentActivePort);
-    nvgText(args.vg, 8, 14, portStr, nullptr);
+    std::snprintf(buf, sizeof(buf), "PORT: %d", s.port);
+    nvgText(args.vg, 8, 14, buf, nullptr);
 
-    char protoStr[32];
-    std::snprintf(protoStr, sizeof(protoStr), "PROTO: %s", module->currentActiveProto == 1 ? "SUB" : "PULL");
-    nvgText(args.vg, 8, 25, protoStr, nullptr);
+    std::snprintf(buf, sizeof(buf), "PROTO: %s", s.proto == 1 ? "SUB" : "PULL");
+    nvgText(args.vg, 8, 25, buf, nullptr);
 
-    // Индикатор сетевой активности (Heartbeat-точка и статус)
-    bool connected = (module->timeSinceLastPacket.load() < 1.0f);
+    // ── Heartbeat-точка и статус Online/Offline ───────────────
     nvgBeginPath(args.vg);
     nvgCircle(args.vg, box.size.x - 12.f, 10.f, 3.f);
-    if (connected) {
-        nvgFillColor(args.vg, nvgRGBA(0, 255, 100, 255)); // Зелёный (активен)
-    } else {
-        nvgFillColor(args.vg, nvgRGBA(255, 50, 50, 255)); // Красный (нет пакетов)
-    }
+    nvgFillColor(args.vg, s.connected
+        ? nvgRGBA(0, 255, 100, 255)
+        : nvgRGBA(255, 50,  50,  255));
     nvgFill(args.vg);
 
     nvgFontSize(args.vg, 7.f);
     nvgFillColor(args.vg, nvgRGBA(150, 150, 150, 255));
-    nvgText(args.vg, box.size.x - 68.f, 13, connected ? "ONLINE" : "OFFLINE", nullptr);
+    nvgText(args.vg, box.size.x - 68.f, 13, s.connected ? "ONLINE" : "OFFLINE", nullptr);
 
-    // Вывод статуса байпаса
-    bool bypassed = (module->params[ZeroMQSocket::BP_PARAM].getValue() > 0.5f);
-    if (bypassed) {
+    // ── Статус байпаса ────────────────────────────────────────
+    if (s.bypassed) {
         nvgFillColor(args.vg, nvgRGBA(255, 100, 100, 255));
         nvgText(args.vg, box.size.x - 68.f, 25, "BYPASS: ON", nullptr);
     } else {
@@ -307,62 +485,46 @@ void OLEDDisplay::draw(const DrawArgs& args) {
         nvgText(args.vg, box.size.x - 68.f, 25, "BYPASS: OFF", nullptr);
     }
 
-    // Секция мониторов CV (1-9) - маленькие шкалы уровня напряжения
-    float barWidth = 8.f;
-    float barSpacing = 4.f;
-    float startX = 8.f;
-    float startY = 44.f;
-    float maxBarHeight = 10.f;
+    // ── CV-метры (9 полосок) ──────────────────────────────────
+    constexpr float barW   = 8.f, barSp = 4.f;
+    constexpr float bX     = 8.f, bY    = 44.f, bH = 10.f;
 
     nvgFontSize(args.vg, 6.f);
     nvgFillColor(args.vg, nvgRGBA(100, 110, 130, 255));
-    nvgText(args.vg, startX, startY - 4.f, "CV INPUTS (1-9)", nullptr);
+    nvgText(args.vg, bX, bY - 4.f, "CV INPUTS (1-9)", nullptr);
 
     for (int i = 0; i < 9; i++) {
-        float val = bypassed ? 0.f : module->activeFrame.cv[i];
-        if (val > 10.f) val = 10.f;
-        if (val < -10.f) val = -10.f;
-
-        // Приводим -10V..+10V к диапазону 0..1
+        float val = std::max(-10.f, std::min(10.f, s.bypassed ? 0.f : s.cv[i]));
         float norm = (val + 10.f) / 20.f;
-        float barHeight = norm * maxBarHeight;
-        float x = startX + i * (barWidth + barSpacing);
+        float h    = norm * bH;
+        float x    = bX + i * (barW + barSp);
 
-        // Фоновая подложка шкалы
         nvgBeginPath(args.vg);
-        nvgRect(args.vg, x, startY, barWidth, maxBarHeight);
+        nvgRect(args.vg, x, bY, barW, bH);
         nvgFillColor(args.vg, nvgRGBA(30, 35, 45, 255));
         nvgFill(args.vg);
 
-        // Активный уровень сигнала
         nvgBeginPath(args.vg);
-        nvgRect(args.vg, x, startY + (maxBarHeight - barHeight), barWidth, barHeight);
+        nvgRect(args.vg, x, bY + (bH - h), barW, h);
         nvgFillColor(args.vg, nvgRGBA(100, 200, 255, 200));
         nvgFill(args.vg);
     }
 
-    // Секция монитора полифонических голосов (16 точек активности гейтов)
-    float dotRadius = 1.8f;
-    float dotSpacing = 6.6f;
-    float pStartX = 9.f;
-    float pStartY = 64.f;
+    // ── Индикаторы активности 16 голосов ─────────────────────
+    constexpr float dotR = 1.8f, dotSp = 6.6f;
+    constexpr float pX   = 9.f,  pY    = 64.f;
 
     nvgFontSize(args.vg, 6.f);
     nvgFillColor(args.vg, nvgRGBA(100, 110, 130, 255));
-    nvgText(args.vg, pStartX, pStartY - 5.f, "POLY VOICE ACTIVITY", nullptr);
+    nvgText(args.vg, pX, pY - 5.f, "POLY VOICE ACTIVITY", nullptr);
 
     for (int c = 0; c < 16; c++) {
-        bool active = !bypassed && (module->activeFrame.midi_gate[c] > 0.1f);
-        float cx = pStartX + c * dotSpacing;
-        float cy = pStartY + 1.f;
-
+        bool active = !s.bypassed && (s.gate[c] > 0.1f);
         nvgBeginPath(args.vg);
-        nvgCircle(args.vg, cx, cy, dotRadius);
-        if (active) {
-            nvgFillColor(args.vg, nvgRGBA(255, 180, 0, 255)); // Янтарный (голос играет)
-        } else {
-            nvgFillColor(args.vg, nvgRGBA(40, 45, 55, 255)); // Выключен
-        }
+        nvgCircle(args.vg, pX + c * dotSp, pY + 1.f, dotR);
+        nvgFillColor(args.vg, active
+            ? nvgRGBA(255, 180, 0, 255)
+            : nvgRGBA(40,  45,  55, 255));
         nvgFill(args.vg);
     }
 }
