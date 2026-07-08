@@ -51,6 +51,21 @@ def fix_svg(file_path, is_vaporwave=False):
                 gradient.set('y1', '0')
                 gradient.set('y2', '1584')
                 
+    # Remove any clipPath elements that NanoSVG fails to render correctly
+    to_remove = []
+    for parent_el in root.iter():
+        for child in parent_el:
+            if child.tag.endswith('clipPath'):
+                to_remove.append((parent_el, child))
+    for parent_el, child in to_remove:
+        parent_el.remove(child)
+        
+    # Remove clip-path attributes that cause black block fallbacks
+    for el in root.iter():
+        keys_to_del = [k for k in el.attrib.keys() if 'clip-path' in k or k.endswith('clip-path')]
+        for k in keys_to_del:
+            del el.attrib[k]
+            
     # Save back to file
     tree.write(file_path, encoding='utf-8', xml_declaration=True)
     print(f"Successfully fixed {file_path}")
