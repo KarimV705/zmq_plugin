@@ -8,6 +8,7 @@
 #include <string>
 #include <cmath>
 #include <algorithm>
+#include <widget/TransformWidget.hpp>
 
 // ─────────────────────────────────────────────────────────────
 //  Структура пакета данных (57 float = 228 байт)
@@ -400,11 +401,21 @@ struct ZeroMQSocketWidget : ModuleWidget {
         display = createWidget<OLEDDisplay>(mm2px(Vec(5.08, 10.0)));
         addChild(display);
 
-        // Добавляем логотип discotemple (используем недепрекейтнутый widget::SvgWidget)
-        logoWidget = createWidget<widget::SvgWidget>(mm2px(Vec(10.4, 38.0)));
+        // Добавляем логотип discotemple с масштабированием через TransformWidget
+        widget::TransformWidget* logoTransform = new widget::TransformWidget();
+        logoTransform->identity();
+        
+        // Масштабируем с 5334px (ширина оригинального SVG) до целевых 30мм (88.58px)
+        float targetWidthPx = mm2px(30.0f);
+        float scaleFactor = targetWidthPx / 5334.0f;
+        logoTransform->scale(Vec(scaleFactor, scaleFactor));
+        
+        logoWidget = new widget::SvgWidget();
         logoWidget->setSvg(APP->window->loadSvg(asset::plugin(pluginInstance, "res/discotemple_light.svg")));
-        logoWidget->box.size = mm2px(Vec(30.0, 8.3));
-        addChild(logoWidget);
+        logoTransform->addChild(logoWidget);
+        
+        logoTransform->box.pos = mm2px(Vec(10.4, 38.0));
+        addChild(logoTransform);
 
         addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(12.7, 52.0)), module, ZeroMQSocket::PORT_PARAM));
         addParam(createParamCentered<CKSS>(mm2px(Vec(25.4, 52.0)), module, ZeroMQSocket::PROTO_PARAM));
