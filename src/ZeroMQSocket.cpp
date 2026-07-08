@@ -4,6 +4,10 @@
 #include <mutex>
 #include <atomic>
 #include <cstring>
+#include <vector>
+#include <string>
+#include <cmath>
+#include <algorithm>
 
 // ─────────────────────────────────────────────────────────────
 //  Структура пакета данных (57 float = 228 байт)
@@ -27,6 +31,7 @@ struct DisplaySnapshot {
     bool   connected   = false;
     float  cv[9]       = {};
     float  gate[16]    = {};
+    int    theme       = 0;      // 0 = Light, 1 = Dark, 2 = Jungle, 3 = Vaporwave
 };
 
 // ─────────────────────────────────────────────────────────────
@@ -74,6 +79,7 @@ struct ZeroMQSocket : Module {
     // ── Состояние параметров ──────────────────────────────────
     int   currentActivePort  = 5555;
     int   currentActiveProto = 0;
+    int   theme              = 0;  // 0 = Light (по умолчанию), 1 = Dark, 2 = Jungle, 3 = Vaporwave
 
     // FIX: флаг отложенного рестарта — изменение порта/протокола
     // запрашивается из process(), но выполняется асинхронно,
@@ -125,8 +131,8 @@ struct ZeroMQSocket : Module {
                                : zmq::socket_type::pull
             );
 
-            // FIX: захватываем сырой указатель в лямбду, а не this->socket,
-            // чтобы избежать обращения к уже удалённому указателю.
+            // FIX: заменяем сокет в лямбде на локальный указатель,
+            // чтобы избежать обращения к уже удалённому указателю класса.
             zmq::socket_t* rawSocket = socket;
 
             workerThread = new std::thread([this, rawSocket, bindPort, bindProto]() {
@@ -320,6 +326,7 @@ struct ZeroMQSocket : Module {
                 snapshot.proto     = currentActiveProto;
                 snapshot.bypassed  = bypassed;
                 snapshot.connected = connected;
+                snapshot.theme     = theme;  // Передаем тему в UI
                 std::memcpy(snapshot.cv,   activeFrame.cv,        sizeof(snapshot.cv));
                 std::memcpy(snapshot.gate, activeFrame.midi_gate,  sizeof(snapshot.gate));
                 snapshotMutex.unlock();
@@ -333,14 +340,17 @@ struct ZeroMQSocket : Module {
         json_t* root = json_object();
         json_object_set_new(root, "port",  json_integer(currentActivePort));
         json_object_set_new(root, "proto", json_integer(currentActiveProto));
+        json_object_set_new(root, "theme", json_integer(theme));  // Сохраняем тему
         return root;
     }
 
     void dataFromJson(json_t* root) override {
         json_t* jPort  = json_object_get(root, "port");
         json_t* jProto = json_object_get(root, "proto");
+        json_t* jTheme = json_object_get(root, "theme");  // Восстанавливаем тему
         if (jPort)  params[PORT_PARAM].setValue((float)json_integer_value(jPort));
         if (jProto) params[PROTO_PARAM].setValue((float)json_integer_value(jProto));
+        if (jTheme) theme = json_integer_value(jTheme);
     }
 };
 
@@ -359,7 +369,8 @@ struct OLEDDisplay : TransparentWidget {
 
     OLEDDisplay() {
         box.size = Vec(120.f, 70.f);
-        font = APP->window->loadFont(asset::system("res/fonts/ShareTechMono-Regular.ttf"));
+        // FIX: загружаем шрифт из ресурсов плагина вместо системных ресурсов
+        font = APP->window->loadFont(asset::plugin(pluginInstance, "res/fonts/ShareTechMono-Regular.ttf"));
     }
 
     void draw(const DrawArgs& args) override;
@@ -372,7 +383,8 @@ struct ZeroMQSocketWidget : ModuleWidget {
 
     ZeroMQSocketWidget(ZeroMQSocket* module) {
         setModule(module);
-        setPanel(createPanel(asset::plugin(pluginInstance, "res/ZeroMQSocket.svg")));
+        // По умолчанию грузим светлую тему
+        setPanel(createPanel(asset::plugin(pluginInstance, "res/ZeroMQSocket_light.svg")));
 
         addChild(createWidget<ScrewSilver>(Vec(RACK_GRID_WIDTH, 0)));
         addChild(createWidget<ScrewSilver>(Vec(box.size.x - 2 * RACK_GRID_WIDTH, 0)));
@@ -381,6 +393,12 @@ struct ZeroMQSocketWidget : ModuleWidget {
 
         display = createWidget<OLEDDisplay>(mm2px(Vec(5.08, 10.0)));
         addChild(display);
+
+        // Добавляем логотип discotemple (используем недепрекейтнутый widget::SvgWidget)
+        widget::SvgWidget* logoWidget = createWidget<widget::SvgWidget>(mm2px(Vec(10.4, 38.0)));
+        logoWidget->setSvg(APP->window->loadSvg(asset::plugin(pluginInstance, "res/discotemple.svg")));
+        logoWidget->box.size = mm2px(Vec(30.0, 8.3));
+        addChild(logoWidget);
 
         addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(12.7, 52.0)), module, ZeroMQSocket::PORT_PARAM));
         addParam(createParamCentered<CKSS>(mm2px(Vec(25.4, 52.0)), module, ZeroMQSocket::PROTO_PARAM));
@@ -396,13 +414,67 @@ struct ZeroMQSocketWidget : ModuleWidget {
         addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(12.7, 110.0)), module, ZeroMQSocket::POLY_PITCH_OUT));
         addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(25.4, 110.0)), module, ZeroMQSocket::POLY_GATE_OUT));
         addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(38.1, 110.0)), module, ZeroMQSocket::POLY_VEL_OUT));
+
+        // Применяем тему (если загружен существующий патч)
+        updateTheme();
+    }
+
+    void updateTheme() {
+        ZeroMQSocket* module = dynamic_cast<ZeroMQSocket*>(this->module);
+        if (!module) return;
+
+        std::string svgPath;
+        if (module->theme == 0) svgPath = "res/ZeroMQSocket_light.svg";
+        else if (module->theme == 1) svgPath = "res/ZeroMQSocket_dark.svg";
+        else if (module->theme == 2) svgPath = "res/ZeroMQSocket_jungle.svg";
+        else if (module->theme == 3) svgPath = "res/ZeroMQSocket_vaporwave.svg";
+
+        // Используем метод getPanel() вместо прямого доступа к panel
+        app::SvgPanel* svgPanel = dynamic_cast<app::SvgPanel*>(getPanel());
+        if (svgPanel) {
+            svgPanel->setBackground(APP->window->loadSvg(asset::plugin(pluginInstance, svgPath)));
+        }
+    }
+
+    // Добавляем меню выбора темы при правом клике
+    void appendContextMenu(Menu* menu) override {
+        ModuleWidget::appendContextMenu(menu);
+
+        ZeroMQSocket* module = dynamic_cast<ZeroMQSocket*>(this->module);
+        if (!module) return;
+
+        menu->addChild(new MenuSeparator());
+
+        MenuLabel* themeLabel = new MenuLabel();
+        themeLabel->text = "Theme";
+        menu->addChild(themeLabel);
+
+        struct ThemeMenuItem : MenuItem {
+            ZeroMQSocketWidget* widget;
+            int themeId;
+            void onAction(const event::Action& e) override {
+                ZeroMQSocket* m = widget->getModule<ZeroMQSocket>();
+                if (m) {
+                    m->theme = themeId;
+                }
+                widget->updateTheme();
+            }
+        };
+
+        const std::vector<std::string> themeNames = {"Light", "Dark", "Jungle", "Vaporwave"};
+        for (size_t i = 0; i < themeNames.size(); i++) {
+            ThemeMenuItem* item = new ThemeMenuItem();
+            item->text = themeNames[i];
+            item->widget = this;
+            item->themeId = i;
+            item->rightText = (module->theme == (int)i) ? "✔" : "";
+            menu->addChild(item);
+        }
     }
 };
 
 // ─────────────────────────────────────────────────────────────
 //  OLEDDisplay::step() — вызывается из UI-потока каждый кадр.
-//  FIX: забираем snapshot здесь, а не в draw(), чтобы draw()
-//  работал только с локальными данными и был максимально быстрым.
 // ─────────────────────────────────────────────────────────────
 void OLEDDisplay::step() {
     TransparentWidget::step();
@@ -422,27 +494,24 @@ void OLEDDisplay::step() {
 
 // ─────────────────────────────────────────────────────────────
 //  OLEDDisplay::draw() — читает только cachedSnapshot.
-//  Никаких обращений к Module — нет data race.
 // ─────────────────────────────────────────────────────────────
 void OLEDDisplay::draw(const DrawArgs& args) {
-    // Фон
-    nvgBeginPath(args.vg);
-    nvgRoundedRect(args.vg, 0, 0, box.size.x, box.size.y, 4.f);
-    nvgFillColor(args.vg, nvgRGBA(10, 13, 20, 255));
-    nvgFill(args.vg);
-
-    // Рамка
-    nvgStrokeColor(args.vg, nvgRGBA(40, 50, 70, 255));
-    nvgStrokeWidth(args.vg, 1.5f);
-    nvgStroke(args.vg);
-
-    if (!font) return;
-    nvgFontFaceId(args.vg, font->handle);
-
     // ── Режим браузера (нет модуля) ───────────────────────────
     ZeroMQSocketWidget* widget = dynamic_cast<ZeroMQSocketWidget*>(parent);
     bool hasModule = widget && widget->module;
     if (!hasModule) {
+        nvgBeginPath(args.vg);
+        nvgRoundedRect(args.vg, 0, 0, box.size.x, box.size.y, 4.f);
+        nvgFillColor(args.vg, nvgRGBA(10, 13, 20, 255));
+        nvgFill(args.vg);
+
+        nvgStrokeColor(args.vg, nvgRGBA(40, 50, 70, 255));
+        nvgStrokeWidth(args.vg, 1.5f);
+        nvgStroke(args.vg);
+
+        if (!font) return;
+        nvgFontFaceId(args.vg, font->handle);
+
         nvgFontSize(args.vg, 11.f);
         nvgFillColor(args.vg, nvgRGBA(100, 200, 255, 255));
         nvgText(args.vg, 10, 22, "ZMQ SOCKET", nullptr);
@@ -454,35 +523,105 @@ void OLEDDisplay::draw(const DrawArgs& args) {
 
     const DisplaySnapshot& s = cachedSnapshot;
 
+    // Схемы цветов и текстовые метки для тем
+    NVGcolor bgColor;
+    NVGcolor borderColor;
+    NVGcolor textColor;
+    NVGcolor textDimColor;
+    NVGcolor accentColor;
+    NVGcolor voiceActiveColor;
+    NVGcolor voiceInactiveColor;
+
+    std::string offlineText = "OFFLINE";
+    std::string onlineText = "ONLINE";
+    std::string bypassOnText = "BYPASS: ON";
+    std::string bypassOffText = "BYPASS: OFF";
+
+    if (s.theme == 0) { // Light Theme
+        bgColor = nvgRGBA(238, 238, 238, 255);
+        borderColor = nvgRGBA(176, 176, 176, 255);
+        textColor = nvgRGBA(32, 32, 32, 255);
+        textDimColor = nvgRGBA(112, 112, 112, 255);
+        accentColor = s.connected ? nvgRGBA(0, 160, 64, 255) : nvgRGBA(208, 32, 32, 255);
+        voiceActiveColor = nvgRGBA(230, 115, 0, 255);
+        voiceInactiveColor = nvgRGBA(208, 208, 208, 255);
+    } else if (s.theme == 1) { // Dark Theme
+        bgColor = nvgRGBA(10, 13, 20, 255);
+        borderColor = nvgRGBA(40, 50, 70, 255);
+        textColor = nvgRGBA(100, 200, 255, 255);
+        textDimColor = nvgRGBA(150, 150, 150, 255);
+        accentColor = s.connected ? nvgRGBA(0, 255, 100, 255) : nvgRGBA(255, 50, 50, 255);
+        voiceActiveColor = nvgRGBA(255, 180, 0, 255);
+        voiceInactiveColor = nvgRGBA(40, 45, 55, 255);
+    } else if (s.theme == 2) { // Jungle Theme
+        bgColor = nvgRGBA(8, 20, 9, 255);
+        borderColor = nvgRGBA(85, 107, 47, 255);
+        textColor = nvgRGBA(57, 255, 20, 255);
+        textDimColor = nvgRGBA(107, 142, 35, 255);
+        accentColor = s.connected ? nvgRGBA(255, 215, 0, 255) : nvgRGBA(255, 69, 0, 255);
+        voiceActiveColor = nvgRGBA(255, 140, 0, 255);
+        voiceInactiveColor = nvgRGBA(27, 45, 24, 255);
+
+        offlineText = "LOST IN JUNGLE 🌴";
+        onlineText = "HUNTING 🐆";
+        bypassOnText = "RESTING 💤";
+        bypassOffText = "SLASHING 🪵";
+    } else { // Vaporwave Theme
+        bgColor = nvgRGBA(43, 15, 84, 255);
+        borderColor = nvgRGBA(255, 0, 127, 255);
+        textColor = nvgRGBA(1, 205, 254, 255);
+        textDimColor = nvgRGBA(185, 103, 255, 255);
+        accentColor = s.connected ? nvgRGBA(255, 251, 150, 255) : nvgRGBA(5, 0, 255, 255);
+        voiceActiveColor = nvgRGBA(255, 113, 206, 255);
+        voiceInactiveColor = nvgRGBA(77, 0, 128, 255);
+
+        offlineText = "S A D N E S S 💾";
+        onlineText = "V I B I N G 🌌";
+        bypassOnText = "S A D B O Y 😭";
+        bypassOffText = "R U N N I N G 🚗";
+    }
+
+    // Отрисовываем фон с выбранным цветом
+    nvgBeginPath(args.vg);
+    nvgRoundedRect(args.vg, 0, 0, box.size.x, box.size.y, 4.f);
+    nvgFillColor(args.vg, bgColor);
+    nvgFill(args.vg);
+
+    // Рамка с выбранным цветом
+    nvgStrokeColor(args.vg, borderColor);
+    nvgStrokeWidth(args.vg, 1.5f);
+    nvgStroke(args.vg);
+
+    if (!font) return;
+    nvgFontFaceId(args.vg, font->handle);
+
     // ── Порт и протокол ───────────────────────────────────────
     char buf[64];
     nvgFontSize(args.vg, 8.f);
-    nvgFillColor(args.vg, nvgRGBA(100, 200, 255, 255));
+    nvgFillColor(args.vg, textColor);
     std::snprintf(buf, sizeof(buf), "PORT: %d", s.port);
     nvgText(args.vg, 8, 14, buf, nullptr);
 
     std::snprintf(buf, sizeof(buf), "PROTO: %s", s.proto == 1 ? "SUB" : "PULL");
     nvgText(args.vg, 8, 25, buf, nullptr);
 
-    // ── Heartbeat-точка и статус Online/Offline ───────────────
+    // ── Heartbeat-точка и статус ──────────────────────────────
     nvgBeginPath(args.vg);
     nvgCircle(args.vg, box.size.x - 12.f, 10.f, 3.f);
-    nvgFillColor(args.vg, s.connected
-        ? nvgRGBA(0, 255, 100, 255)
-        : nvgRGBA(255, 50,  50,  255));
+    nvgFillColor(args.vg, accentColor);
     nvgFill(args.vg);
 
     nvgFontSize(args.vg, 7.f);
-    nvgFillColor(args.vg, nvgRGBA(150, 150, 150, 255));
-    nvgText(args.vg, box.size.x - 68.f, 13, s.connected ? "ONLINE" : "OFFLINE", nullptr);
+    nvgFillColor(args.vg, textDimColor);
+    nvgText(args.vg, box.size.x - 68.f, 13, s.connected ? onlineText.c_str() : offlineText.c_str(), nullptr);
 
     // ── Статус байпаса ────────────────────────────────────────
     if (s.bypassed) {
         nvgFillColor(args.vg, nvgRGBA(255, 100, 100, 255));
-        nvgText(args.vg, box.size.x - 68.f, 25, "BYPASS: ON", nullptr);
+        nvgText(args.vg, box.size.x - 68.f, 25, bypassOnText.c_str(), nullptr);
     } else {
-        nvgFillColor(args.vg, nvgRGBA(100, 255, 150, 255));
-        nvgText(args.vg, box.size.x - 68.f, 25, "BYPASS: OFF", nullptr);
+        nvgFillColor(args.vg, s.theme == 0 ? nvgRGBA(0, 150, 50, 255) : nvgRGBA(100, 255, 150, 255));
+        nvgText(args.vg, box.size.x - 68.f, 25, bypassOffText.c_str(), nullptr);
     }
 
     // ── CV-метры (9 полосок) ──────────────────────────────────
@@ -490,7 +629,7 @@ void OLEDDisplay::draw(const DrawArgs& args) {
     constexpr float bX     = 8.f, bY    = 44.f, bH = 10.f;
 
     nvgFontSize(args.vg, 6.f);
-    nvgFillColor(args.vg, nvgRGBA(100, 110, 130, 255));
+    nvgFillColor(args.vg, textDimColor);
     nvgText(args.vg, bX, bY - 4.f, "CV INPUTS (1-9)", nullptr);
 
     for (int i = 0; i < 9; i++) {
@@ -501,12 +640,12 @@ void OLEDDisplay::draw(const DrawArgs& args) {
 
         nvgBeginPath(args.vg);
         nvgRect(args.vg, x, bY, barW, bH);
-        nvgFillColor(args.vg, nvgRGBA(30, 35, 45, 255));
+        nvgFillColor(args.vg, s.theme == 0 ? nvgRGBA(220, 220, 220, 255) : nvgRGBA(30, 35, 45, 255));
         nvgFill(args.vg);
 
         nvgBeginPath(args.vg);
         nvgRect(args.vg, x, bY + (bH - h), barW, h);
-        nvgFillColor(args.vg, nvgRGBA(100, 200, 255, 200));
+        nvgFillColor(args.vg, textColor);
         nvgFill(args.vg);
     }
 
@@ -515,16 +654,14 @@ void OLEDDisplay::draw(const DrawArgs& args) {
     constexpr float pX   = 9.f,  pY    = 64.f;
 
     nvgFontSize(args.vg, 6.f);
-    nvgFillColor(args.vg, nvgRGBA(100, 110, 130, 255));
+    nvgFillColor(args.vg, textDimColor);
     nvgText(args.vg, pX, pY - 5.f, "POLY VOICE ACTIVITY", nullptr);
 
     for (int c = 0; c < 16; c++) {
         bool active = !s.bypassed && (s.gate[c] > 0.1f);
         nvgBeginPath(args.vg);
         nvgCircle(args.vg, pX + c * dotSp, pY + 1.f, dotR);
-        nvgFillColor(args.vg, active
-            ? nvgRGBA(255, 180, 0, 255)
-            : nvgRGBA(40,  45,  55, 255));
+        nvgFillColor(args.vg, active ? voiceActiveColor : voiceInactiveColor);
         nvgFill(args.vg);
     }
 }
