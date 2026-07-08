@@ -1,0 +1,25 @@
+{
+  "slug": "zmq_plugin",
+  "name": "ZeroMQ Socket",
+  "version": "2.0.0",
+  "license": "open-source",
+  "brand": "ZeroMQ Socket",
+  "author": "discotemple",
+  "authorEmail": "discotemple@protonmail.com",
+  "authorUrl": "",
+  "pluginUrl": "",
+  "manualUrl": "",
+  "sourceUrl": "",
+  "donateUrl": "",
+  "changelogUrl": "",
+  "modules": [
+    {
+      "slug": "ZeroMQSocket",
+      "name": "Socket",
+      "description": "Socket that convert any data from zeromq to cv.",
+      "tags": [
+        "External"
+      ]
+    }
+  ]
+}
