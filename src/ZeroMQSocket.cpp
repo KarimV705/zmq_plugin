@@ -380,9 +380,15 @@ struct OLEDDisplay : TransparentWidget {
 // ─────────────────────────────────────────────────────────────
 struct ZeroMQSocketWidget : ModuleWidget {
     OLEDDisplay* display = nullptr;
+    widget::SvgWidget* logoWidget = nullptr;
+    std::shared_ptr<Font> panelFont;
 
     ZeroMQSocketWidget(ZeroMQSocket* module) {
         setModule(module);
+        
+        // Загружаем шрифт для отрисовки надписей панели в C++
+        panelFont = APP->window->loadFont(asset::plugin(pluginInstance, "res/fonts/ShareTechMono-Regular.ttf"));
+
         // По умолчанию грузим светлую тему
         setPanel(createPanel(asset::plugin(pluginInstance, "res/ZeroMQSocket_light.svg")));
 
@@ -395,8 +401,8 @@ struct ZeroMQSocketWidget : ModuleWidget {
         addChild(display);
 
         // Добавляем логотип discotemple (используем недепрекейтнутый widget::SvgWidget)
-        widget::SvgWidget* logoWidget = createWidget<widget::SvgWidget>(mm2px(Vec(10.4, 38.0)));
-        logoWidget->setSvg(APP->window->loadSvg(asset::plugin(pluginInstance, "res/discotemple.svg")));
+        logoWidget = createWidget<widget::SvgWidget>(mm2px(Vec(10.4, 38.0)));
+        logoWidget->setSvg(APP->window->loadSvg(asset::plugin(pluginInstance, "res/discotemple_light.svg")));
         logoWidget->box.size = mm2px(Vec(30.0, 8.3));
         addChild(logoWidget);
 
@@ -424,16 +430,102 @@ struct ZeroMQSocketWidget : ModuleWidget {
         if (!module) return;
 
         std::string svgPath;
-        if (module->theme == 0) svgPath = "res/ZeroMQSocket_light.svg";
-        else if (module->theme == 1) svgPath = "res/ZeroMQSocket_dark.svg";
-        else if (module->theme == 2) svgPath = "res/ZeroMQSocket_jungle.svg";
-        else if (module->theme == 3) svgPath = "res/ZeroMQSocket_vaporwave.svg";
+        std::string logoPath;
+        if (module->theme == 0) {
+            svgPath = "res/ZeroMQSocket_light.svg";
+            logoPath = "res/discotemple_light.svg";
+        }
+        else if (module->theme == 1) {
+            svgPath = "res/ZeroMQSocket_dark.svg";
+            logoPath = "res/discotemple_dark.svg";
+        }
+        else if (module->theme == 2) {
+            svgPath = "res/ZeroMQSocket_jungle.svg";
+            logoPath = "res/discotemple_jungle.svg";
+        }
+        else if (module->theme == 3) {
+            svgPath = "res/ZeroMQSocket_vaporwave.svg";
+            logoPath = "res/discotemple_vaporwave.svg";
+        }
 
         // Используем метод getPanel() вместо прямого доступа к panel
         app::SvgPanel* svgPanel = dynamic_cast<app::SvgPanel*>(getPanel());
         if (svgPanel) {
             svgPanel->setBackground(APP->window->loadSvg(asset::plugin(pluginInstance, svgPath)));
         }
+
+        if (logoWidget) {
+            logoWidget->setSvg(APP->window->loadSvg(asset::plugin(pluginInstance, logoPath)));
+        }
+    }
+
+    // Отрисовываем надписи на панели динамически
+    void draw(const DrawArgs& args) override {
+        // Сначала рисуем саму панель (SVG фоны без текста)
+        ModuleWidget::draw(args);
+
+        ZeroMQSocket* module = dynamic_cast<ZeroMQSocket*>(this->module);
+        int currentTheme = module ? module->theme : 0; // По умолчанию Light (0) для браузера модулей
+
+        // Выбираем цвета надписей в зависимости от темы
+        NVGcolor textColor;
+        NVGcolor subColor;
+
+        if (currentTheme == 0) { // Light
+            textColor = nvgRGBA(40, 40, 40, 255);
+            subColor = nvgRGBA(96, 96, 96, 255);
+        } else if (currentTheme == 1) { // Dark
+            textColor = nvgRGBA(160, 161, 165, 255);
+            subColor = nvgRGBA(96, 97, 101, 255);
+        } else if (currentTheme == 2) { // Jungle
+            textColor = nvgRGBA(57, 255, 20, 255); // Neon lime green
+            subColor = nvgRGBA(255, 215, 0, 255); // Yellow/banana
+        } else { // Vaporwave
+            textColor = nvgRGBA(1, 205, 254, 255); // Neon cyan
+            subColor = nvgRGBA(255, 113, 206, 255); // Synthwave pink
+        }
+
+        if (!panelFont) return;
+        nvgFontFaceId(args.vg, panelFont->handle);
+        nvgTextAlign(args.vg, NVG_ALIGN_CENTER | NVG_ALIGN_BASELINE);
+
+        // 1. Заголовки ручек управления (y = 116)
+        nvgFontSize(args.vg, 9.f);
+        nvgFillColor(args.vg, textColor);
+        nvgText(args.vg, 37.5f, 116.f, "PORT", nullptr);
+        nvgText(args.vg, 75.f, 116.f, "PROTO", nullptr);
+        nvgText(args.vg, 112.5f, 116.f, "BP", nullptr);
+
+        // 2. Секция CV Out
+        nvgFontSize(args.vg, 9.f);
+        nvgFillColor(args.vg, textColor);
+        nvgText(args.vg, 75.f, 172.f, "CV OUT (1-9)", nullptr);
+
+        nvgFontSize(args.vg, 8.5f);
+        nvgFillColor(args.vg, subColor);
+        // CV Numbers (Сетка выходов)
+        nvgText(args.vg, 37.5f, 186.f, "1", nullptr);
+        nvgText(args.vg, 75.f, 186.f, "2", nullptr);
+        nvgText(args.vg, 112.5f, 186.f, "3", nullptr);
+
+        nvgText(args.vg, 37.5f, 221.f, "4", nullptr);
+        nvgText(args.vg, 75.f, 221.f, "5", nullptr);
+        nvgText(args.vg, 112.5f, 221.f, "6", nullptr);
+
+        nvgText(args.vg, 37.5f, 256.f, "7", nullptr);
+        nvgText(args.vg, 75.f, 256.f, "8", nullptr);
+        nvgText(args.vg, 112.5f, 256.f, "9", nullptr);
+
+        // 3. Секция Poly MIDI Out
+        nvgFontSize(args.vg, 9.f);
+        nvgFillColor(args.vg, textColor);
+        nvgText(args.vg, 75.f, 302.f, "POLY MIDI OUT", nullptr);
+
+        nvgFontSize(args.vg, 8.f);
+        nvgFillColor(args.vg, subColor);
+        nvgText(args.vg, 37.5f, 344.f, "PITCH", nullptr);
+        nvgText(args.vg, 75.f, 344.f, "GATE", nullptr);
+        nvgText(args.vg, 112.5f, 344.f, "VEL", nullptr);
     }
 
     // Добавляем меню выбора темы при правом клике
